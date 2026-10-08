@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NavMesh Flood-Fill with Vector Bias</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #1a202c; /* Tailwind gray-900 */
+            color: #e2e8f0; /* Tailwind gray-200 */
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        #controls {
+            background-color: #2d3748; /* Tailwind gray-800 */
+            padding: 0.75rem 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            z-index: 10;
+        }
+
+        .controls-row {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            background-color: #4a5568; /* Tailwind gray-700 */
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem; /* rounded-md */
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            font-weight: 500;
+        }
+
+        .btn:hover {
+            background-color: #718096; /* Tailwind gray-600 */
+        }
+
+        .btn-primary {
+            background-color: #3182ce; /* Tailwind blue-600 */
+        }
+
+        .btn-primary:hover {
+            background-color: #2b6cb0; /* Tailwind blue-700 */
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        #canvas-container {
+            flex-grow: 1;
+            position: relative;
+            cursor: crosshair;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        #info-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background-color: rgba(45, 55, 72, 0.8);
+            padding: 1rem;
+            border-radius: 0.5rem;
+            pointer-events: none;
+        }
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        input[type="range"] {
+            accent-color: #3182ce;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <div class="controls-row">
+            <div class="control-group">
+                <span class="font-bold text-lg mr-4">Vector Bias Flood-Fill</span>
+                <span class="text-xs text-gray-400 font-mono" id="mesh-label">mesh…</span>
+                <span class="text-sm text-gray-400">Mode:</span>
+                <span id="mode-indicator" class="font-mono bg-gray-700 px-2 py-1 rounded text-sm text-yellow-300">Place LKP & Vector</span>
+            </div>
+
+            <div class="control-group">
+                <label for="bias-strength" class="text-sm">Forward boost α:</label>
+                <input type="range" id="bias-strength" min="0" max="2" step="0.1" value="1.0" class="w-24">
+                <span id="bias-value" class="text-sm font-mono w-8 text-right">1.0</span>
+
+                <label for="flood-limit" class="text-sm ml-4">Flood Limit:</label>
+                <input type="range" id="flood-limit" min="100" max="3000" step="50" value="400" class="w-24">
+                <span id="limit-value" class="text-sm font-mono w-10 text-right">400</span>
+            </div>
+
+            <div class="control-group">
+                <button id="btn-reset-flood" class="btn">Clear Flood</button>
+                <button id="btn-init-flood" class="btn btn-primary">Init Flood-Fill</button>
+            </div>
+        </div>
+
+        <div class="controls-row text-sm">
+            <div class="control-group">
+                <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" id="hard-backward-block" class="rounded">
+                    <span>Hard backward block</span>
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer ml-2" title="Rear cone/plane and β only affect nodes LKP can see">
+                    <input type="checkbox" id="wall-occlusion" class="rounded" checked>
+                    <span>Wall occlusion (rear rules if LKP sees node)</span>
+                </label>
+            </div>
+
+            <div class="control-group">
+                <label for="travel-cone" class="text-sm">Travel cone:</label>
+                <input type="range" id="travel-cone" min="30" max="180" step="5" value="180" class="w-28">
+                <span id="cone-value" class="text-sm font-mono w-12 text-right">180°</span>
+
+                <label for="backward-penalty" class="text-sm ml-3">Backward penalty β:</label>
+                <input type="range" id="backward-penalty" min="1" max="50" step="1" value="5" class="w-28">
+                <span id="penalty-value" class="text-sm font-mono w-10 text-right">5×</span>
+            </div>
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="gameCanvas"></canvas>
+        <div id="info-panel">
+            <h3 class="font-bold text-blue-300 mb-2">Instructions</h3>
+            <ul class="text-sm space-y-1 list-disc list-inside">
+                <li><strong>demo-levelHeavy</strong> nav (uniform triangles). <strong>Click</strong> near a vertex for LKP; <strong>drag</strong> heading. <strong>Wheel</strong> zoom, <strong>Shift+drag</strong> pan.</li>
+                <li>Re-export: <code class="text-xs">python3 tools/export_navscout_mesh.py</code> (optional <code class="text-xs">--max-edge 96</code>).</li>
+                <li><strong>Forward boost α</strong> cheapens forward edges; <strong>Backward penalty β</strong> punishes reverse steps.</li>
+                <li><strong>Hard backward block</strong> rejects reverse edges in LKP-visible space only (when occlusion is on).</li>
+                <li><strong>Wall occlusion</strong>: rear cone/plane and β apply only where LKP has line-of-sight — pockets behind walls flood after you wrap around. Nozzle: seed cannot spray into the rear half-plane.</li>
+                <li>Click <strong>Init Flood-Fill</strong> to run the simulation.</li>
+            </ul>
+        </div>
+    </div>
+
+    <script src="navscout_demo_mesh.js"></script>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const container = document.getElementById('canvas-container');
+
+        // UI Elements
+        const modeIndicator = document.getElementById('mode-indicator');
+        const btnInitFlood = document.getElementById('btn-init-flood');
+        const btnResetFlood = document.getElementById('btn-reset-flood');
+        const biasSlider = document.getElementById('bias-strength');
+        const biasValue = document.getElementById('bias-value');
+        const limitSlider = document.getElementById('flood-limit');
+        const limitValue = document.getElementById('limit-value');
+        const hardBackwardBlockEl = document.getElementById('hard-backward-block');
+        const wallOcclusionEl = document.getElementById('wall-occlusion');
+        const travelConeSlider = document.getElementById('travel-cone');
+        const coneValue = document.getElementById('cone-value');
+        const backwardPenaltySlider = document.getElementById('backward-penalty');
+        const penaltyValue = document.getElementById('penalty-value');
+
+        // State variables
+        let width, height;
+        let isDragging = false;
+        let lkpNode = null; // Node closest to the Last Known Position
+        let lkpRawPos = null;
+        let travelVector = { x: 0, y: 0 };
+        let normalizedTravelVector = { x: 0, y: 1 };
+        let dragEndPos = null;
+
+        // NavMesh Data (demo-levelHeavy, subdivided triangles)
+        let nodes = [];
+        let polygons = [];
+        let wallSegments = [];
+        let meshBounds = null;
+        let meshLoaded = false;
+        let view = { x: 0, y: 0, scale: 0.2 };
+        const meshLabel = document.getElementById('mesh-label');
+
+        // Flood Fill Data
+        let floodedNodes = new Map(); // node index -> accumulated cost
+        let floodActive = false;
+        let floodQueue = [];
+        let maxFloodCost = 400;
+        let vectorBiasStrength = 1.0;
+        let hardBackwardBlock = false;
+        let wallOcclusionRearGates = true;
+        let maxTravelConeDeg = 180;
+        let backwardPenaltyScale = 5.0;
+        const backwardPenaltyExponent = 2;
+        const REAR_PLANE_SLACK = 6;
+        const LOS_RAY_EPS = 1e-5;
+        let lkpVisibleFromLkp = null; // Map nodeIdx -> bool, rebuilt per flood / draw
+
+        const NODE_RADIUS = 3;
+
+        function worldToScreen(p) {
+            return { x: p.x * view.scale + view.x, y: p.y * view.scale + view.y };
+        }
+
+        function screenToWorld(p) {
+            return { x: (p.x - view.x) / view.scale, y: (p.y - view.y) / view.scale };
+        }
+
+        function fitViewToMesh() {
+            if (!meshBounds) return;
+            const { minX, minY, maxX, maxY } = meshBounds;
+            const pad = 80;
+            const mw = maxX - minX + pad * 2;
+            const mh = maxY - minY + pad * 2;
+            view.scale = Math.min(width / mw, height / mh);
+            view.x = width * 0.5 - (minX + maxX) * 0.5 * view.scale;
+            view.y = height * 0.5 - (minY + maxY) * 0.5 * view.scale;
+        }
+
+        function applyDemoMesh(data) {
+            if (!data || !data.nodes || !data.polygons) {
+                throw new Error('Invalid navscout mesh payload');
+            }
+            nodes = data.nodes.map((p, id) => ({
+                x: p[0],
+                y: p[1],
+                id,
+                neighbors: (data.neighbors && data.neighbors[id]) ? [...data.neighbors[id]] : [],
+            }));
+            polygons = data.polygons.map((tri) => [...tri]);
+            wallSegments = data.wall_segments || [];
+            meshBounds = data.bounds || null;
+            if (!meshBounds && nodes.length) {
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                for (const n of nodes) {
+                    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+                    maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
+                }
+                meshBounds = { minX, minY, maxX, maxY };
+            }
+            meshLoaded = true;
+            const edgeNote = data.subdiv_max_edge ? ` · ≤${data.subdiv_max_edge}px` : '';
+            meshLabel.textContent = `${polygons.length} tris · ${nodes.length} vtx${edgeNote}`;
+        }
+
+        async function loadDemoMesh() {
+            if (window.NAVSCOUT_DEMO_MESH) {
+                applyDemoMesh(window.NAVSCOUT_DEMO_MESH);
+                return;
+            }
+            const res = await fetch('navscout_demo_mesh.json');
+            if (!res.ok) throw new Error(`Mesh fetch failed: ${res.status}`);
+            applyDemoMesh(await res.json());
+        }
+
+        function resizeCanvas() {
+            width = container.clientWidth;
+            height = container.clientHeight;
+            canvas.width = width;
+            canvas.height = height;
+            if (meshLoaded) fitViewToMesh();
+            draw();
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+
+        // Vector Math Helpers
+        function distance(p1, p2) {
+            return Math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2);
+        }
+
+        function normalize(v) {
+            const mag = Math.sqrt(v.x * v.x + v.y * v.y);
+            if (mag === 0) return { x: 0, y: 0 };
+            return { x: v.x / mag, y: v.y / mag };
+        }
+
+        function dotProduct(v1, v2) {
+            return v1.x * v2.x + v1.y * v2.y;
+        }
+        
+        function getDirectionVector(p1, p2) {
+             const dir = { x: p2.x - p1.x, y: p2.y - p1.y };
+             return normalize(dir);
+        }
+
+        function getLkpAnchor() {
+            if (lkpNode === null) return null;
+            return nodes[lkpNode];
+        }
+
+        /** U from LKP to point P (unit vector). */
+        function unitFromLkpTo(p) {
+            const anchor = getLkpAnchor();
+            if (!anchor) return { x: 0, y: 0 };
+            return getDirectionVector(anchor, p);
+        }
+
+        /** Scalar progress along travel vector from LKP. */
+        function forwardProgressFromLkp(p) {
+            const anchor = getLkpAnchor();
+            if (!anchor) return 0;
+            return dotProduct(
+                { x: p.x - anchor.x, y: p.y - anchor.y },
+                normalizedTravelVector
+            );
+        }
+
+        function minConeAlignmentDot() {
+            const halfRad = (maxTravelConeDeg / 2) * (Math.PI / 180);
+            return Math.cos(halfRad);
+        }
+
+        function passesLkpGeometricGates(p) {
+            const u = unitFromLkpTo(p);
+            const planeDot = dotProduct(u, normalizedTravelVector);
+            if (planeDot < minConeAlignmentDot()) {
+                return false;
+            }
+            return true;
+        }
+
+        /** True when node lies in the global rear cone / half-plane from LKP. */
+        function isInLkpRearZone(p) {
+            if (forwardProgressFromLkp(p) < -REAR_PLANE_SLACK) {
+                return true;
+            }
+            const u = unitFromLkpTo(p);
+            if (u.x === 0 && u.y === 0) {
+                return false;
+            }
+            return dotProduct(u, normalizedTravelVector) < minConeAlignmentDot();
+        }
+
+        function buildLkpVisibilityCache() {
+            const cache = new Map();
+            const anchor = getLkpAnchor();
+            if (!anchor) {
+                return cache;
+            }
+            for (let i = 0; i < nodes.length; i++) {
+                cache.set(i, hasLineOfSight(anchor, nodes[i]));
+            }
+            return cache;
+        }
+
+        function ensureLkpVisibilityCache() {
+            if (lkpNode === null) {
+                lkpVisibleFromLkp = null;
+                return null;
+            }
+            if (!lkpVisibleFromLkp) {
+                lkpVisibleFromLkp = buildLkpVisibilityCache();
+            }
+            return lkpVisibleFromLkp;
+        }
+
+        /** Hard rear hemisphere / cone block for this node index. */
+        function rearPositionBlocked(nodeIdx, isSeed) {
+            if (isSeed) {
+                return false;
+            }
+            const p = nodes[nodeIdx];
+            if (wallOcclusionRearGates) {
+                if (!isInLkpRearZone(p)) {
+                    return false;
+                }
+                const vis = ensureLkpVisibilityCache();
+                if (vis && !vis.get(nodeIdx)) {
+                    return false;
+                }
+                return true;
+            }
+            return !passesLkpGeometricGates(p);
+        }
+
+        function edgeBiasApplies(currentIdx, neighborIdx) {
+            if (!wallOcclusionRearGates) {
+                return true;
+            }
+            const vis = ensureLkpVisibilityCache();
+            if (!vis) {
+                return true;
+            }
+            return vis.get(neighborIdx) === true;
+        }
+
+        function hardBackwardEdgeBlocked(edgeAlign, currentIdx, neighborIdx) {
+            if (edgeAlign >= 0) {
+                return false;
+            }
+            if (!hardBackwardBlock) {
+                return false;
+            }
+            if (!wallOcclusionRearGates) {
+                return true;
+            }
+            const vis = ensureLkpVisibilityCache();
+            if (!vis) {
+                return true;
+            }
+            return vis.get(currentIdx) && vis.get(neighborIdx);
+        }
+
+        function edgeCostMultiplier(edgeAlignment) {
+            const m = edgeAlignment;
+            if (m >= 0) {
+                const mult = 1.0 - vectorBiasStrength * m;
+                return Math.max(0.15, mult);
+            }
+            const back = Math.pow(Math.abs(m), backwardPenaltyExponent);
+            return 1.0 + backwardPenaltyScale * back;
+        }
+
+        function rerunFloodIfActive() {
+            if (floodActive) executeFloodFill();
+        }
+
+        function hasLineOfSight(p1, p2) {
+            for (const seg of wallSegments) {
+                const a = { x: seg[0][0], y: seg[0][1] };
+                const b = { x: seg[1][0], y: seg[1][1] };
+                if (lineBlocksSight(p1, p2, a, b)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /** Wall crossing for LOS; ignore hits at ray endpoints (nav verts on boundary walls). */
+        function lineBlocksSight(l1p1, l1p2, l2p1, l2p2) {
+            let q = (l1p1.y - l2p1.y) * (l2p2.x - l2p1.x) - (l1p1.x - l2p1.x) * (l2p2.y - l2p1.y);
+            let d = (l1p2.x - l1p1.x) * (l2p2.y - l2p1.y) - (l1p2.y - l1p1.y) * (l2p2.x - l2p1.x);
+
+            if (d == 0) return false;
+
+            let r = q / d;
+            q = (l1p1.y - l2p1.y) * (l1p2.x - l1p1.x) - (l1p1.x - l2p1.x) * (l1p2.y - l1p1.y);
+            let s = q / d;
+
+            if (r < 0 || r > 1 || s < 0 || s > 1) return false;
+            if (r <= LOS_RAY_EPS || r >= 1 - LOS_RAY_EPS) return false;
+            return true;
+        }
+
+        function getMousePos(evt) {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: evt.clientX - rect.left,
+                y: evt.clientY - rect.top
+            };
+        }
+
+        function getClosestNode(worldPos) {
+            let closest = null;
+            let minDist = Infinity;
+            const pickR = Math.max(24, 48 / view.scale);
+            for (let i = 0; i < nodes.length; i++) {
+                const d = distance(worldPos, nodes[i]);
+                if (d < minDist && d < pickR) {
+                    minDist = d;
+                    closest = i;
+                }
+            }
+            return closest;
+        }
+
+        let isPanning = false;
+        let panStart = null;
+
+        canvas.addEventListener('mousedown', (e) => {
+            const sp = getMousePos(e);
+            if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
+                isPanning = true;
+                panStart = { sp, viewX: view.x, viewY: view.y };
+                e.preventDefault();
+                return;
+            }
+            if (floodActive) return;
+            if (e.button !== 0) return;
+
+            const pos = screenToWorld(sp);
+            const nodeIdx = getClosestNode(pos);
+            
+            if (nodeIdx !== null) {
+                isDragging = true;
+                lkpRawPos = sp;
+                dragEndPos = sp;
+                lkpNode = nodeIdx;
+                lkpVisibleFromLkp = null;
+                normalizedTravelVector = { x: 0, y: 1 }; // Reset
+                draw();
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            const sp = getMousePos(e);
+            if (isPanning && panStart) {
+                view.x = panStart.viewX + (sp.x - panStart.sp.x);
+                view.y = panStart.viewY + (sp.y - panStart.sp.y);
+                draw();
+                return;
+            }
+            if (isDragging) {
+                dragEndPos = sp;
+                const w0 = screenToWorld(lkpRawPos);
+                const w1 = screenToWorld(dragEndPos);
+                if (distance(w0, w1) > 12 / view.scale) {
+                    normalizedTravelVector = getDirectionVector(w0, w1);
+                }
+                draw();
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            if (isPanning) {
+                isPanning = false;
+                panStart = null;
+                return;
+            }
+            if (isDragging) {
+                isDragging = false;
+                if (lkpNode !== null) {
+                    lkpVisibleFromLkp = null;
+                    btnInitFlood.disabled = false;
+                    modeIndicator.textContent = "Ready to Flood";
+                    modeIndicator.className = "font-mono bg-blue-900 px-2 py-1 rounded text-sm text-blue-300";
+                }
+                draw();
+            }
+        });
+
+        // UI Listeners
+        biasSlider.addEventListener('input', (e) => {
+            vectorBiasStrength = parseFloat(e.target.value);
+            biasValue.textContent = vectorBiasStrength.toFixed(1);
+            rerunFloodIfActive();
+        });
+
+        limitSlider.addEventListener('input', (e) => {
+            maxFloodCost = parseInt(e.target.value);
+            limitValue.textContent = maxFloodCost;
+            rerunFloodIfActive();
+        });
+
+        hardBackwardBlockEl.addEventListener('change', (e) => {
+            hardBackwardBlock = e.target.checked;
+            rerunFloodIfActive();
+            draw();
+        });
+
+        wallOcclusionEl.addEventListener('change', (e) => {
+            wallOcclusionRearGates = e.target.checked;
+            lkpVisibleFromLkp = null;
+            rerunFloodIfActive();
+            draw();
+        });
+
+        travelConeSlider.addEventListener('input', (e) => {
+            maxTravelConeDeg = parseInt(e.target.value, 10);
+            coneValue.textContent = `${maxTravelConeDeg}°`;
+            rerunFloodIfActive();
+            draw();
+        });
+
+        backwardPenaltySlider.addEventListener('input', (e) => {
+            backwardPenaltyScale = parseFloat(e.target.value);
+            penaltyValue.textContent = `${backwardPenaltyScale}×`;
+            rerunFloodIfActive();
+        });
+
+        btnResetFlood.addEventListener('click', () => {
+            floodActive = false;
+            floodedNodes.clear();
+            lkpNode = null;
+            lkpRawPos = null;
+            dragEndPos = null;
+            lkpVisibleFromLkp = null;
+            btnInitFlood.disabled = true;
+            btnInitFlood.textContent = "Init Flood-Fill";
+            modeIndicator.textContent = "Place LKP & Vector";
+            modeIndicator.className = "font-mono bg-gray-700 px-2 py-1 rounded text-sm text-yellow-300";
+            draw();
+        });
+
+        btnInitFlood.addEventListener('click', () => {
+            if (lkpNode !== null) {
+                executeFloodFill();
+                floodActive = true;
+                btnInitFlood.textContent = "Update Flood";
+                modeIndicator.textContent = "Flood Active";
+                modeIndicator.className = "font-mono bg-green-900 px-2 py-1 rounded text-sm text-green-300";
+                draw();
+            }
+        });
+
+        function executeFloodFill() {
+            if (lkpNode === null) return;
+
+            floodedNodes.clear();
+            lkpVisibleFromLkp = buildLkpVisibilityCache();
+            const hasTravel = normalizedTravelVector.x !== 0 || normalizedTravelVector.y !== 0;
+
+            let pq = [{ nodeIdx: lkpNode, costSoFar: 0, parentIdx: null }];
+            const minCostToNode = new Map();
+            minCostToNode.set(lkpNode, 0);
+
+            while (pq.length > 0) {
+                pq.sort((a, b) => a.costSoFar - b.costSoFar);
+                const current = pq.shift();
+
+                if (current.costSoFar > maxFloodCost) {
+                    continue;
+                }
+
+                if (floodedNodes.has(current.nodeIdx) && floodedNodes.get(current.nodeIdx) < current.costSoFar) {
+                    continue;
+                }
+
+                const node = nodes[current.nodeIdx];
+                const isSeed = current.nodeIdx === lkpNode;
+
+                if (hasTravel && rearPositionBlocked(current.nodeIdx, isSeed)) {
+                    continue;
+                }
+
+                floodedNodes.set(current.nodeIdx, current.costSoFar);
+
+                for (let i = 0; i < node.neighbors.length; i++) {
+                    const neighborIdx = node.neighbors[i];
+                    const neighbor = nodes[neighborIdx];
+
+                    const distCost = distance(node, neighbor);
+                    const dirToNeighbor = getDirectionVector(node, neighbor);
+                    const edgeAlign = hasTravel ? dotProduct(normalizedTravelVector, dirToNeighbor) : 0;
+
+                    if (hasTravel && hardBackwardEdgeBlocked(edgeAlign, current.nodeIdx, neighborIdx)) {
+                        continue;
+                    }
+
+                    if (hasTravel && rearPositionBlocked(neighborIdx, false)) {
+                        continue;
+                    }
+
+                    if (hasTravel && isSeed && isInLkpRearZone(neighbor)) {
+                        continue;
+                    }
+
+                    const biasModifier = hasTravel && edgeBiasApplies(current.nodeIdx, neighborIdx)
+                        ? edgeCostMultiplier(edgeAlign)
+                        : 1.0;
+                    const stepCost = distCost * biasModifier;
+                    const newCost = current.costSoFar + stepCost;
+
+                    if (newCost <= maxFloodCost) {
+                        const existingMin = minCostToNode.get(neighborIdx);
+                        if (existingMin === undefined || newCost < existingMin) {
+                            minCostToNode.set(neighborIdx, newCost);
+                            pq.push({ nodeIdx: neighborIdx, costSoFar: newCost, parentIdx: current.nodeIdx });
+                        }
+                    }
+                }
+            }
+        }
+
+        function drawTriangleScreen(p1, p2, p3, fill, stroke, lineW = 1) {
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.lineTo(p3.x, p3.y);
+            ctx.closePath();
+            if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+            if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lineW; ctx.stroke(); }
+        }
+
+        function draw() {
+            ctx.fillStyle = '#1a202c';
+            ctx.fillRect(0, 0, width, height);
+            if (!meshLoaded) {
+                ctx.fillStyle = '#a0aec0';
+                ctx.font = '14px Inter, sans-serif';
+                ctx.fillText('Loading demo-levelHeavy mesh…', 24, 32);
+                return;
+            }
+
+            ctx.strokeStyle = 'rgba(45, 55, 72, 0.85)';
+            ctx.lineWidth = 1.5;
+            for (const seg of wallSegments) {
+                const a = worldToScreen({ x: seg[0][0], y: seg[0][1] });
+                const b = worldToScreen({ x: seg[1][0], y: seg[1][1] });
+                ctx.beginPath();
+                ctx.moveTo(a.x, a.y);
+                ctx.lineTo(b.x, b.y);
+                ctx.stroke();
+            }
+
+            for (const poly of polygons) {
+                const p1 = worldToScreen(nodes[poly[0]]);
+                const p2 = worldToScreen(nodes[poly[1]]);
+                const p3 = worldToScreen(nodes[poly[2]]);
+                drawTriangleScreen(
+                    p1, p2, p3,
+                    'rgba(74, 85, 104, 0.08)',
+                    'rgba(74, 85, 104, 0.22)',
+                    0.75,
+                );
+            }
+
+            // Draw Flooded Polygons
+            if (floodActive && floodedNodes.size > 0) {
+                for (const poly of polygons) {
+                    const n1Idx = poly[0];
+                    const n2Idx = poly[1];
+                    const n3Idx = poly[2];
+                    
+                    // If all 3 vertices of a polygon are flooded, color it
+                    if (floodedNodes.has(n1Idx) && floodedNodes.has(n2Idx) && floodedNodes.has(n3Idx)) {
+                        
+                        // Calculate average cost to color based on heat
+                        const avgCost = (floodedNodes.get(n1Idx) + floodedNodes.get(n2Idx) + floodedNodes.get(n3Idx)) / 3;
+                        const ratio = 1 - (avgCost / maxFloodCost); // 1 = start, 0 = edge of flood
+                        
+                        // Color mapping: Inner = Red/Orange, Outer = Yellow/Green
+                        // Using a simple hue shift
+                        const hue = 0 + (ratio * 60);
+                        const alpha = 0.3 + (ratio * 0.4);
+                        drawTriangleScreen(
+                            worldToScreen(nodes[n1Idx]),
+                            worldToScreen(nodes[n2Idx]),
+                            worldToScreen(nodes[n3Idx]),
+                            `hsla(${hue}, 80%, 50%, ${alpha})`,
+                            `hsla(${hue}, 80%, 50%, ${alpha + 0.2})`,
+                            1,
+                        );
+                    }
+                }
+            }
+
+            // LKP visibility / enforced rear zone (debug)
+            if (lkpNode !== null && wallOcclusionRearGates) {
+                const vis = ensureLkpVisibilityCache();
+                if (vis) {
+                    for (let i = 0; i < nodes.length; i++) {
+                        if (i === lkpNode || floodedNodes.has(i)) {
+                            continue;
+                        }
+                        const p = worldToScreen(nodes[i]);
+                        if (!vis.get(i) && isInLkpRearZone(nodes[i])) {
+                            ctx.beginPath();
+                            ctx.arc(p.x, p.y, NODE_RADIUS + 2, 0, Math.PI * 2);
+                            ctx.strokeStyle = 'rgba(128, 90, 213, 0.55)';
+                            ctx.lineWidth = 1.5;
+                            ctx.stroke();
+                        } else if (vis.get(i) && isInLkpRearZone(nodes[i])) {
+                            ctx.beginPath();
+                            ctx.arc(p.x, p.y, NODE_RADIUS + 2, 0, Math.PI * 2);
+                            ctx.strokeStyle = 'rgba(245, 101, 101, 0.45)';
+                            ctx.lineWidth = 1.5;
+                            ctx.stroke();
+                        }
+                    }
+                }
+            }
+
+            // Forward half-plane + travel cone at LKP
+            if (lkpNode !== null && (normalizedTravelVector.x !== 0 || normalizedTravelVector.y !== 0)) {
+                const lkpW = nodes[lkpNode];
+                const lkp = worldToScreen(lkpW);
+                const coneHalfRad = (maxTravelConeDeg / 2) * (Math.PI / 180);
+                const travelAngle = Math.atan2(normalizedTravelVector.y, normalizedTravelVector.x);
+                const reach = Math.max(width, height) * 1.5;
+
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(lkp.x, lkp.y);
+                ctx.arc(lkp.x, lkp.y, reach, travelAngle - coneHalfRad, travelAngle + coneHalfRad);
+                ctx.closePath();
+                ctx.fillStyle = wallOcclusionRearGates
+                    ? 'rgba(99, 179, 237, 0.07)'
+                    : 'rgba(245, 101, 101, 0.07)';
+                ctx.fill();
+
+                const perpX = -normalizedTravelVector.y;
+                const perpY = normalizedTravelVector.x;
+                const planeReach = 2800 * view.scale;
+                ctx.beginPath();
+                ctx.moveTo(lkp.x - perpX * planeReach, lkp.y - perpY * planeReach);
+                ctx.lineTo(lkp.x + perpX * planeReach, lkp.y + perpY * planeReach);
+                ctx.strokeStyle = 'rgba(160, 174, 192, 0.35)';
+                ctx.setLineDash([8, 6]);
+                ctx.lineWidth = 1;
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.restore();
+            }
+
+            if (lkpNode !== null) {
+                const lkp = worldToScreen(nodes[lkpNode]);
+                ctx.beginPath();
+                ctx.arc(lkp.x, lkp.y, NODE_RADIUS * 2.5, 0, Math.PI * 2);
+                ctx.fillStyle = '#4299e1';
+                ctx.fill();
+                ctx.strokeStyle = '#ebf8ff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                if (normalizedTravelVector.x !== 0 || normalizedTravelVector.y !== 0) {
+                    const arrowLen = 72;
+                    const endX = lkp.x + normalizedTravelVector.x * arrowLen;
+                    const endY = lkp.y + normalizedTravelVector.y * arrowLen;
+                    ctx.beginPath();
+                    ctx.moveTo(lkp.x, lkp.y);
+                    ctx.lineTo(endX, endY);
+                    ctx.strokeStyle = '#63b3ed';
+                    ctx.lineWidth = 3;
+                    ctx.stroke();
+                    const angle = Math.atan2(normalizedTravelVector.y, normalizedTravelVector.x);
+                    ctx.beginPath();
+                    ctx.moveTo(endX, endY);
+                    ctx.lineTo(endX - 15 * Math.cos(angle - Math.PI / 6), endY - 15 * Math.sin(angle - Math.PI / 6));
+                    ctx.lineTo(endX - 15 * Math.cos(angle + Math.PI / 6), endY - 15 * Math.sin(angle + Math.PI / 6));
+                    ctx.closePath();
+                    ctx.fillStyle = '#63b3ed';
+                    ctx.fill();
+                }
+
+                if (isDragging && dragEndPos) {
+                    ctx.beginPath();
+                    ctx.moveTo(lkpRawPos.x, lkpRawPos.y);
+                    ctx.lineTo(dragEndPos.x, dragEndPos.y);
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+                    ctx.setLineDash([5, 5]);
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
+            }
+        }
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const sp = getMousePos(e);
+            const before = screenToWorld(sp);
+            const factor = e.deltaY < 0 ? 1.1 : 0.9;
+            view.scale = Math.min(3, Math.max(0.04, view.scale * factor));
+            const after = screenToWorld(sp);
+            view.x += (after.x - before.x) * view.scale;
+            view.y += (after.y - before.y) * view.scale;
+            draw();
+        }, { passive: false });
+
+        btnInitFlood.disabled = true;
+
+        loadDemoMesh()
+            .then(() => {
+                resizeCanvas();
+            })
+            .catch((err) => {
+                console.error(err);
+                meshLabel.textContent = 'mesh load failed';
+            });
+
+    </script>
+</body>
+</html>
